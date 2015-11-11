@@ -1,0 +1,21 @@
+target/
+/.lib/
+
+*~
+/.ensime
+
+*.cache
+*.classpath
+*.project
+*.settings/
+*.scalastyle
+
+.history
+.idea
+.idea_modules
+
+*.swp
+
+src/main/resources/*.overrides.conf
+#webapp/public # TODO readd ignore when CORS issue fixed
+logs/
