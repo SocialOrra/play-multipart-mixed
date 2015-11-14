@@ -6,6 +6,24 @@ lazy val commonSettings = Seq(
   version := "1.0.0",
   organization := "com.socialorra",
   scalaVersion := "2.11.7",
+  javacOptions ++= Seq("-source", "1.8", "-target", "1.8", "-Xlint:unchecked", "-encoding", "UTF-8"),
+  scalacOptions += "-deprecation",
+  pomExtra := {
+    <scm>
+      <url>https://github.com/socialorra/play-multipart-mixed</url>
+      <connection>scm:git:git@github.com:socialorra/play-multipart-mixed.git</connection>
+    </scm>
+      <developers>
+        <developer>
+          <id>socialorra</id>
+          <name>SocialOrra</name>
+          <url>https://socialorra.com</url>
+        </developer>
+      </developers>
+  },
+  pomIncludeRepository := { _ => false },
+  homepage := Some(url(s"https://github.com/socialorra/play-multipart-mixed")),
+  licenses := Seq("Apache-2.0" -> url("http://www.apache.org/licenses/LICENSE-2.0.html")),
   resolvers ++= Seq(Resolver.mavenLocal,
     "Sonatype OSS Releases" at "http://oss.sonatype.org/content/repositories/releases/",
     "Sonatype OSS Snapshots" at "http://oss.sonatype.org/content/repositories/snapshots/",
