@@ -7,9 +7,10 @@ import play.api.libs.iteratee.Parsing.MatchInfo
 import play.api.libs.iteratee._
 import play.api.mvc._
 import play.api.http.HttpProtocol.HTTP_1_1
-
-import play.api.{ Logger, Application }
+import play.api.mvc.Results._
+import play.api.Application
 import play.core.parsers.FormUrlEncodedParser
+
 import scala.concurrent.Future
 import scala.concurrent.ExecutionContext.Implicits._
 import scala.util.control.NonFatal
@@ -49,9 +50,26 @@ object MultipartMixed {
   sealed trait Part
   case class MultipartMixed(innerRequests: Seq[InnerRequestPart], badParts: Seq[BadPart])
 
-  // TODO: add content-id header support
   // TODO: add content-type: application/http
   case class InnerRequestPart(rh: RequestHeader, body: Array[Byte], contentId: Option[String] = None) extends Part
+  case class InnerResultPart(result: Result) extends Part
+
+  class BadInnerResult extends InnerResultPart(BadRequest)
+  object BadInnerResult {
+    private val result = new BadInnerResult
+    def apply() = result
+  }
+
+  case class ResponseStatusLine(version: String, code: Int, reason: Option[String])
+  object ResponseStatusLine {
+    def apply(versionCodeReason: Array[String]): Option[ResponseStatusLine] = {
+      versionCodeReason.length match {
+        case 3 ⇒ Some(ResponseStatusLine(versionCodeReason(0), versionCodeReason(1).toInt, Some(versionCodeReason(3))))
+        case 2 ⇒ Some(ResponseStatusLine(versionCodeReason(0), versionCodeReason(1).toInt, None))
+        case 1 ⇒ None
+      }
+    }
+  }
 
   case class BadPart(headers: Map[String, String]) extends Part
   case class InnerRequestInfo(headers: Map[String, String], contentType: Option[String])
@@ -92,7 +110,7 @@ object MultipartMixed {
     BodyParser("multipartMixed") { request ⇒
 
       val parser = Traversable.takeUpTo[Array[Byte]](maxLength).transform(
-        multipartParser(DefaultMaxTextLength, innerRequestPartHandler)(request)).flatMap {
+        multipartParser(innerRequestPartHandler)(request)).flatMap {
           case d @ Left(r) ⇒ Iteratee.eofOrElse(r)(d)
           case d           ⇒ checkForEof(request)(d)
         }
@@ -105,7 +123,55 @@ object MultipartMixed {
     }
   }
 
-  def multipartParser(maxDataLength: Int, innerRequestHandler: RequestHeader ⇒ PartHandler[InnerRequestPart]): BodyParser[MultipartMixed] = BodyParser("multipartMixed") { request ⇒
+  /** Given a MultipartMixed Request, attempts to route it's internal
+   *  requests to the appropriate Play route / controller and collects
+   *  the responses into a single Result instance.
+   *  @param request the MultipartMixed request
+   *  @return the composite result containing results for all internal requests
+   */
+  def response(request: Request[MultipartMixed]) = {
+    Future {
+      val resultFutures = request.body.innerRequests
+        .filterNot(_.isInstanceOf[BadInnerRequest])
+        .map { req ⇒ (Request.apply(req.rh, req.body), req.contentId) }
+        .map {
+          case (r, contentId) ⇒
+
+            val handler = Play.current.global.onRouteRequest(r)
+            handler.map {
+              case action: EssentialAction ⇒ proxyAction(action)(r, contentId)
+              case x                       ⇒ Future.failed[(Result, Option[String])](new IllegalArgumentException(s"Unexpected handler type"))
+            } getOrElse {
+              Future.failed[(Result, Option[String])](new IllegalArgumentException(s"No handler for request '$r'"))
+            }
+        }
+
+      val resultsFuture = Future.sequence(resultFutures)
+      val empty = Enumerator(Array.empty[Byte])
+
+      val bodyEnumerator = resultsFuture.map { resultsList ⇒
+        // wrap results with boundary, append "--" at the end of the last one
+        Enumerator(BOUNDARY.withLeadingDashes) andThen
+          resultsList.map {
+            case (result, contentId) ⇒
+              Enumerator(CRLF) andThen
+                Enumerator(initialHeaders(contentId)) andThen
+                Enumerator(CRLFCRLF) andThen
+                Enumerator(responseLineAndHeaders(result)) andThen
+                Enumerator(CRLFCRLF) andThen
+                result.body andThen
+                Enumerator(CRLF) andThen
+                Enumerator(BOUNDARY.withLeadingDashes)
+          }.fold(empty)(_ andThen _) andThen
+          Enumerator(DASHDASH)
+      }
+
+      val responseHeaders = Map(s"Content-Type" -> s"multipart/mixed; boundary=${BOUNDARY.value}")
+      Result(ResponseHeader(play.api.http.Status.OK, responseHeaders), Enumerator.flatten(bodyEnumerator))
+    }
+  }
+
+  private def multipartParser(innerRequestHandler: RequestHeader ⇒ PartHandler[InnerRequestPart]): BodyParser[MultipartMixed] = BodyParser("multipartMixed") { request ⇒
 
     val maybeBoundary = for {
       mt ← request.mediaType
@@ -136,24 +202,24 @@ object MultipartMixed {
     }
   }
 
-  private def parseParts(
-    originalRequest: RequestHeader,
-    innerRequestHandler: RequestHeader ⇒ PartHandler[Part],
+  private def parseParts[ParserDataType](
+    originalData: ParserDataType,
+    handler: ParserDataType ⇒ PartHandler[Part],
     parts: List[Part] = Nil): Parser[Either[Result, List[Part]]] = {
 
-    parsePart(originalRequest, innerRequestHandler).flatMap {
+    parsePart(originalData, handler).flatMap {
       case None ⇒ Done(Right(parts)) // None, we've reached the end of the body
       case Some(other: Part) ⇒ // All other parts
         for {
           _ ← Iteratee.head // Drop the boundary
-          result ← parseParts(originalRequest, innerRequestHandler, other :: parts)
+          result ← parseParts(originalData, handler, other :: parts)
         } yield result
     }
   }
 
-  private def parsePart(
-    originalRequest: RequestHeader,
-    innerRequestHandler: RequestHeader ⇒ PartHandler[Part]): Parser[Option[Part]] = {
+  private def parsePart[ParserDataType](
+    originalData: ParserDataType,
+    handler: ParserDataType ⇒ PartHandler[Part]): Parser[Option[Part]] = {
 
     val collectHeaders: Iteratee[Array[Byte], Option[(Map[String, String], Array[Byte])]] = maxHeaderBuffer.map { buffer ⇒
 
@@ -169,18 +235,18 @@ object MultipartMixed {
       }
     }
 
-    val readPart: PartHandler[Part] = innerRequestHandler(originalRequest)
+    val readPart: PartHandler[Part] = handler(originalData)
       .orElse({ case headers ⇒ Done(BadPart(headers), Input.Empty) })
 
     // Take up to the boundary, remove the MatchInfo wrapping, collect headers, and then read the part
     takeUpToBoundary compose Enumeratee.map[MatchInfo[Array[Byte]]](_.content) transform collectHeaders.flatMap {
       case Some((headers, left)) ⇒ Iteratee.flatten(readPart(headers).feed(Input.El(left))).map(Some.apply)
-      case _                     ⇒ Done(None)
+      case x                     ⇒ Done(None)
     }
 
   }
 
-  def handleInnerRequestPart(originalRequest: RequestHeader): PartHandler[InnerRequestPart] = {
+  private def handleInnerRequestPart(originalRequest: RequestHeader): PartHandler[InnerRequestPart] = {
 
     case InnerRequestMatcher(contentType, headers) ⇒
 
@@ -217,7 +283,6 @@ object MultipartMixed {
 
       collectHeadersAndBody.flatMap[InnerRequestPart] {
         case Some((rh, left)) ⇒
-          Logger.info(s"$rh -> body=${new String(left)}")
           Done(InnerRequestPart(rh, left, contentId = headers.get("content-id")))
 
         case _ ⇒ Done(BadInnerRequest())
@@ -285,44 +350,65 @@ object MultipartMixed {
     override def id: Long = 123L
   }
 
-  def response(request: Request[MultipartMixed]) = {
-    Future {
-      val resultFutures = request.body.innerRequests
-        .filterNot(_.isInstanceOf[BadInnerRequest])
-        .map { req ⇒ (Request.apply(req.rh, req.body), req.contentId) }
-        .map {
-          case (r, contentId) ⇒
+  private def handleInnerResponsePart(originalResponse: Result): PartHandler[InnerResultPart] = {
+    case headers ⇒
 
-            val handler = Play.current.global.onRouteRequest(r)
-            handler.map {
-              case action: EssentialAction ⇒ proxyAction(action)(r, contentId)
-              case x                       ⇒ Future.failed[(Result, Option[String])](new IllegalArgumentException(s"Unexpected handler type"))
-            } getOrElse {
-              Future.failed[(Result, Option[String])](new IllegalArgumentException(s"No handler for request '$r'"))
-            }
+      val collectHeadersAndBody: Iteratee[Array[Byte], Option[Result]] = maxHeaderBuffer.map { buffer ⇒
+
+        val (versionCodeReasonBytes, restForHeaders) = Option(buffer).map(b ⇒ b.splitAt(b.indexOfSlice(CRLF))).get
+        val versionCodeReasonStr = new String(versionCodeReasonBytes, "utf-8").trim.split(" ", 2)
+        val (headerString, rest) = splitHeaders(Some(restForHeaders))
+
+        if (headerString.startsWith("--") || headerString.isEmpty) {
+          None // It's the last part
+        } else {
+          val statusLine = ResponseStatusLine(versionCodeReasonStr)
+          val _headers = parseHeaders(headerString)
+          val left = rest.drop(CRLFCRLF.length)
+          statusLine map { sl ⇒
+            val responseHeader = new ResponseHeader(sl.code, _headers, sl.reason)
+            Result(responseHeader, Enumerator(left))
+          }
         }
-
-      val resultsFuture = Future.sequence(resultFutures)
-      val empty = Enumerator(Array.empty[Byte])
-
-      val bodyEnumerator = resultsFuture.map { resultsList ⇒
-        // wrap results with boundary, append "--" at the end of the last one
-        Enumerator(BOUNDARY.withLeadingDashes) andThen
-          resultsList.map {
-            case (result, contentId) ⇒
-              Enumerator(CRLF) andThen
-                Enumerator(initialHeaders(contentId)) andThen
-                Enumerator(CRLFCRLF) andThen
-                Enumerator(responseLineAndHeaders(result)) andThen
-                Enumerator(CRLFCRLF) andThen
-                result.body andThen
-                Enumerator(CRLF) andThen
-                Enumerator(BOUNDARY.withLeadingDashes)
-          }.fold(empty)(_ andThen _) andThen
-          Enumerator(DASHDASH)
       }
 
-      Result(ResponseHeader(play.api.http.Status.OK), Enumerator.flatten(bodyEnumerator))
+      collectHeadersAndBody.flatMap[InnerResultPart] {
+        case Some(result) ⇒
+          Done(InnerResultPart(result))
+
+        case _ ⇒ Done(BadInnerResult())
+      }
+  }
+
+  /** Given the result of a MultipartMixed request, attempts to parse it
+   *  via the returned Iteratee.
+   *  @param result the MultipartMixed Result
+   *  @return Iteratee with Either a Result or a tuple with lists of proper and bad results.
+   */
+  def parseResult(result: Result): Iteratee[Array[Byte], Either[Result, (List[Result], List[BadPart])]] = {
+    val maybeBoundary = for {
+      boundary ← result.header.headers.find(_._2.contains("boundary=")).map { v ⇒ v._2.substring(v._2.indexOf("boundary=") + 9, v._2.size) }
+    } yield ("\r\n--" + boundary).getBytes("utf-8")
+
+    maybeBoundary.map { boundary ⇒
+      for {
+        // First, we ignore the first boundary.  Note that if the body contains a preamble, this won't work.  But the
+        // body never contains a preamble.
+        _ ← Traversable.take[Array[Byte]](boundary.size - 2) transform Iteratee.ignore
+        // We use the search Enumeratee to turn the stream into a stream of data chunks that are either the boundary,
+        // or not the boundary, and we parse that
+        results ← Parsing.search(boundary) transform parseParts(result, handleInnerResponsePart)
+      } yield {
+        results.right.map { reversed ⇒
+          // We built the parts by prepending a list, so we need to reverse them
+          val parts = reversed.reverse
+          val innerResults = parts.collect { case innerResult: InnerResultPart ⇒ innerResult } map { _.result }
+          val bad = parts.collect { case bad: BadPart ⇒ bad }
+          (innerResults, bad)
+        }
+      }
+    } getOrElse {
+      Done(Left(BadRequest))
     }
   }
 
@@ -331,8 +417,7 @@ object MultipartMixed {
     try {
       val actionIteratee = action(request)
       val data = request.body
-      //Logger.warn(s"making request: method: ${request.method} uri:${request.uri} headers:${request.headers} body:${new String(data)}")
-      Iteratee.flatten(actionIteratee.feed(Input.El(data))).run.map { r ⇒ /*Logger.info("got result: " + r);*/ (r, contentId) }
+      Iteratee.flatten(actionIteratee.feed(Input.El(data))).run.map { r ⇒ (r, contentId) }
     } catch {
       case NonFatal(e) ⇒ Future.failed(e)
     }
