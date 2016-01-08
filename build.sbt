@@ -33,7 +33,7 @@ lazy val commonSettings = Seq(
 )
 
 lazy val deps = Seq(
-  "com.typesafe.play" %% "play" % "2.4.3" % "provided",
+  "com.typesafe.play" %% "play" % "2.4.6" % "provided",
   "org.scalatest" %% "scalatest" % "2.2.1" % "test",
   "org.scalatestplus" %% "play" % "1.4.0-M3" % "test"
 )
